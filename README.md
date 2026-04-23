@@ -6,7 +6,7 @@ Zeroth Order Optimisation Toolkit.
 
 The full package manual is available here:
 
-➡️ [ZoSolvers Manual (PDF)](Docs/OptiLine_Manual.pdf)
+➡️ [ZoSolvers Manual (PDF)](Docs/ZoSolvers_Manual.pdf)
 
 This document explains:
 
