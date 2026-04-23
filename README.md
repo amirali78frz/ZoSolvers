@@ -22,6 +22,11 @@ ZoSolvers provides gradient-free solvers for **minimisation** and **minimax** pr
 
 ## Installation
 
+**From PyPI (system-wide):**
+```bash
+pip install ZoSolvers
+```
+
 **From wheel (system-wide):**
 ```bash
 pip install dist/zosolvers-0.1.0-py3-none-any.whl
