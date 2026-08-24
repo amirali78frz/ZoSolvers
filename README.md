@@ -5,6 +5,7 @@
 ZoSolvers provides gradient-free solvers for **minimisation** and **minimax** problems. When the gradient of the objective is unavailable — because the function is non-differentiable, comes from a black-box simulator, or is too expensive to differentiate — ZoSolvers estimates it using random directional perturbations.
 
 📖 Full documentation: [ZoSolvers Manual (PDF)](Docs/ZoSolvers_Manual.pdf)
+
 [PyPI](https://pypi.org/project/ZoSolvers/))
 
 ---
