@@ -17,7 +17,7 @@ ZoSolvers provides gradient-free solvers for **minimisation** and **minimax** pr
 - **Constrained problems** — pass any projection function
 - **Early stopping** — based on relative function decrease or oracle norm
 - **Efficient sampling** — Cholesky factorisation cached at construction; diagonal `B` handled without matrix inversion
-
+- **Parallelism** — utilisation of CPU cores to evaluate the samples of one mini-batch in parallel
 ---
 
 ## Installation
