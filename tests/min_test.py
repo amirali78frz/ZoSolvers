@@ -5,13 +5,22 @@ Coverage:
   - Initialisation (attributes, B caching, error handling)
   - Sampling (_sample_gaussian, _sample_sphere, _sample dispatch)
   - Oracle (shape, methods, unbiasedness for both oracle types and B structures)
-  - ZOGD  (convergence, projection, early stopping, t="iteration", small N)
-  - ZOEGm (convergence, projection, gamma, t="iteration", small N)
+  - Mini-batch (batch_oracle mean, variance reduction with t)
+  - Parallelism (n_jobs resolution, chunking, thread/process backends,
+                 pool lifecycle, equivalence with sequential execution)
+  - ZOGD  (convergence, projection, project_init, early stopping,
+           t="iteration", small N)
+  - ZOEGm (convergence, projection, project_init, gamma, t="iteration",
+           small N)
 """
+
+import threading
+import time
 
 import numpy as np
 import pytest
 from ZoSolvers.minimisation import ZO_gauss_min
+from ZoSolvers.utils import chunk_sizes, resolve_n_jobs
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +34,15 @@ def f_quadratic(x):
 
 def proj_box(x, lo=-3.0, hi=3.0):
     return np.clip(x, lo, hi)
+
+
+def f_slow(x):
+    """Quadratic that sleeps, so concurrent workers actually overlap.
+
+    Must stay at module level to remain picklable for the process backend.
+    """
+    time.sleep(0.002)
+    return f_quadratic(x)
 
 
 def _make_solver(d=2, oracle_type="gaussian", B=None, proj=None, **overrides):
@@ -90,6 +108,11 @@ class TestInit:
     def test_sphere_oracle_type_stored(self):
         opt = ZO_gauss_min(f_quadratic, np.zeros(2), oracle_type="sphere")
         assert opt.oracle_type == "sphere"
+
+    def test_project_init_defaults_to_false(self):
+        assert ZO_gauss_min(f_quadratic, np.zeros(2)).project_init is False
+        assert ZO_gauss_min(f_quadratic, np.zeros(2),
+                            project_init=True).project_init is True
 
 
 # ---------------------------------------------------------------------------
@@ -257,11 +280,43 @@ class TestZOGD:
         assert self._converged(x)
 
     def test_projection_keeps_iterates_in_feasible_set(self):
+        """Every computed iterate is feasible. Row 0 is the caller's x0, which
+        is returned unprojected unless project_init=True."""
         np.random.seed(42)
         opt = ZO_gauss_min(f_quadratic, np.array([5.0, 5.0]),
                            h=1.0, mu=1e-8, N=200, t=1, proj=proj_box)
         x = opt.ZOGD()
+        assert np.all(x[1:] >= -3.0 - 1e-10) and np.all(x[1:] <= 3.0 + 1e-10)
+
+    def test_x0_returned_unprojected_by_default(self):
+        np.random.seed(42)
+        opt = ZO_gauss_min(f_quadratic, np.array([5.0, 5.0]),
+                           h=1.0, mu=1e-8, N=20, t=1, proj=proj_box)
+        assert opt.project_init is False
+        np.testing.assert_array_equal(opt.ZOGD()[0], [5.0, 5.0])
+
+    def test_project_init_makes_every_iterate_feasible(self):
+        np.random.seed(42)
+        opt = ZO_gauss_min(f_quadratic, np.array([5.0, 5.0]),
+                           h=1.0, mu=1e-8, N=200, t=1, proj=proj_box,
+                           project_init=True)
+        x = opt.ZOGD()
+        np.testing.assert_array_equal(x[0], [3.0, 3.0])
         assert np.all(x >= -3.0 - 1e-10) and np.all(x <= 3.0 + 1e-10)
+
+    def test_project_init_is_noop_without_proj(self):
+        np.random.seed(42)
+        opt = ZO_gauss_min(f_quadratic, np.array([5.0, 5.0]),
+                           h=0.1, mu=1e-8, N=20, t=1, project_init=True)
+        np.testing.assert_array_equal(opt.ZOGD()[0], [5.0, 5.0])
+
+    def test_project_init_does_not_mutate_x0(self):
+        np.random.seed(42)
+        x0 = np.array([5.0, 5.0])
+        opt = ZO_gauss_min(f_quadratic, x0, h=1.0, mu=1e-8, N=20, t=1,
+                           proj=proj_box, project_init=True)
+        opt.ZOGD()
+        np.testing.assert_array_equal(opt.x0, [5.0, 5.0])
 
     def test_tol_f_triggers_early_stop(self):
         np.random.seed(42)
@@ -343,11 +398,32 @@ class TestZOEGm:
         assert self._converged(x)
 
     def test_projection_keeps_iterates_in_feasible_set(self):
+        """Row 0 is the caller's x0, returned unprojected unless project_init."""
         np.random.seed(42)
         opt = ZO_gauss_min(f_quadratic, np.array([5.0, 5.0]),
                            h=0.5, mu=1e-8, N=200, t=1, proj=proj_box)
         x = opt.ZOEGm()
+        assert np.all(x[1:] >= -3.0 - 1e-10) and np.all(x[1:] <= 3.0 + 1e-10)
+
+    def test_project_init_makes_every_iterate_feasible(self):
+        np.random.seed(42)
+        opt = ZO_gauss_min(f_quadratic, np.array([5.0, 5.0]),
+                           h=0.5, mu=1e-8, N=200, t=1, proj=proj_box,
+                           project_init=True)
+        x = opt.ZOEGm()
+        np.testing.assert_array_equal(x[0], [3.0, 3.0])
         assert np.all(x >= -3.0 - 1e-10) and np.all(x <= 3.0 + 1e-10)
+
+    def test_intermediate_point_is_projected(self):
+        """xhat must be projected before it is used for the second stride."""
+        np.random.seed(0)
+        seen = []
+        opt = ZO_gauss_min(lambda v: (seen.append(np.array(v)), f_quadratic(v))[1],
+                           np.array([5.0, 5.0]), h=5.0, mu=1e-8, N=3, t=1,
+                           proj=proj_box, project_init=True)
+        opt.ZOEGm()
+        # every point the objective was queried at sits within mu of the box
+        assert all(np.all(np.abs(v) <= 3.0 + 1e-6) for v in seen)
 
     def test_tol_f_triggers_early_stop(self):
         np.random.seed(42)
@@ -382,3 +458,263 @@ class TestZOEGm:
                            h=0.1, mu=1e-5, N=5, t=1)
         x = opt.ZOEGm()
         assert len(x) <= 5
+
+
+# ---------------------------------------------------------------------------
+# Mini-batch
+# ---------------------------------------------------------------------------
+
+class TestBatchOracle:
+    """The t samples of one step are independent draws that are averaged."""
+
+    def test_batch_oracle_shape(self):
+        np.random.seed(0)
+        opt = ZO_gauss_min(f_quadratic, np.zeros(3), mu=1e-8, t=8)
+        assert opt.batch_oracle(np.ones(3), "center", 8).shape == (3,)
+
+    def test_batch_oracle_is_unbiased(self):
+        np.random.seed(0)
+        x = np.array([2.0, -1.0])
+        opt = ZO_gauss_min(f_quadratic, np.zeros(2), mu=1e-8, t=4000)
+        np.testing.assert_allclose(opt.batch_oracle(x, "center", 4000), x, atol=0.15)
+
+    def test_larger_t_reduces_error(self):
+        """Averaging more samples must shrink the error towards grad f(x) = x."""
+        x = np.array([2.0, -1.0])
+        errors = []
+        for t in (1, 16, 256):
+            opt = ZO_gauss_min(f_quadratic, np.zeros(2), mu=1e-8, t=t)
+            np.random.seed(0)
+            err = np.mean([np.linalg.norm(opt.batch_oracle(x, "center", t) - x)
+                           for _ in range(30)])
+            errors.append(err)
+        assert errors[0] > errors[1] > errors[2]
+
+    def test_samples_within_a_batch_are_independent(self):
+        """Two draws of one batch must not be the same vector."""
+        np.random.seed(0)
+        opt = ZO_gauss_min(f_quadratic, np.zeros(2), mu=1e-8, t=2)
+        draws = [opt.oracle(np.array([2.0, -1.0]), "center") for _ in range(5)]
+        assert not any(np.array_equal(draws[0], d) for d in draws[1:])
+
+    def test_num_samples_respects_t(self):
+        opt = ZO_gauss_min(f_quadratic, np.zeros(2), t=7)
+        assert opt._num_samples(3) == 7
+        opt = ZO_gauss_min(f_quadratic, np.zeros(2), t="iteration")
+        assert opt._num_samples(3) == 3
+
+
+# ---------------------------------------------------------------------------
+# Parallelism
+# ---------------------------------------------------------------------------
+
+class TestParallelHelpers:
+    def test_default_is_sequential(self):
+        opt = ZO_gauss_min(f_quadratic, np.zeros(2))
+        assert opt.n_jobs == 1
+        assert opt.backend == "thread"
+
+    def test_resolve_n_jobs_positive(self):
+        assert resolve_n_jobs(1) == 1
+        assert resolve_n_jobs(4) == 4
+        assert resolve_n_jobs(None) == 1
+
+    def test_resolve_n_jobs_negative_counts_back_from_all_cores(self):
+        import os
+        n_cpu = os.cpu_count() or 1
+        assert resolve_n_jobs(-1) == n_cpu
+        if n_cpu > 1:
+            assert resolve_n_jobs(-2) == n_cpu - 1
+
+    def test_resolve_n_jobs_zero_raises(self):
+        with pytest.raises(ValueError, match="non-zero"):
+            resolve_n_jobs(0)
+
+    @pytest.mark.parametrize("total,n_chunks,expected_sum", [(10, 4, 10), (3, 8, 3), (1, 4, 1)])
+    def test_chunk_sizes_partition_exactly(self, total, n_chunks, expected_sum):
+        sizes = chunk_sizes(total, n_chunks)
+        assert sum(sizes) == expected_sum
+        assert all(n > 0 for n in sizes)
+        assert len(sizes) <= min(n_chunks, total)
+
+    def test_chunk_sizes_are_balanced(self):
+        sizes = chunk_sizes(10, 4)
+        assert max(sizes) - min(sizes) <= 1
+
+    def test_invalid_n_jobs_raises(self):
+        with pytest.raises(ValueError, match="non-zero"):
+            ZO_gauss_min(f_quadratic, np.zeros(2), n_jobs=0)
+
+    def test_invalid_backend_raises(self):
+        with pytest.raises(ValueError, match="backend"):
+            ZO_gauss_min(f_quadratic, np.zeros(2), backend="dask")
+
+
+class TestParallelExecution:
+    def test_pool_is_created_lazily(self):
+        opt = ZO_gauss_min(f_quadratic, np.zeros(2), mu=1e-8, t=4, n_jobs=2)
+        assert opt._pool is None                     # nothing spawned yet
+        opt.batch_oracle(np.ones(2), "center", 4)
+        assert opt._pool is not None
+        opt.close()
+
+    def test_sequential_solver_never_creates_a_pool(self):
+        opt = ZO_gauss_min(f_quadratic, np.zeros(2), h=0.1, mu=1e-8, N=20, t=4)
+        opt.ZOGD("center")
+        assert opt._pool is None
+
+    def test_pool_is_reused_across_iterations(self):
+        opt = ZO_gauss_min(f_quadratic, np.full(2, 3.0), h=0.1, mu=1e-8,
+                           N=10, t=4, n_jobs=2)
+        opt.batch_oracle(np.ones(2), "center", 4)
+        first = opt._pool
+        opt.ZOGD("center")
+        assert opt._pool is first                    # same executor, not respawned
+        opt.close()
+
+    def test_close_is_idempotent(self):
+        opt = ZO_gauss_min(f_quadratic, np.zeros(2), mu=1e-8, t=4, n_jobs=2)
+        opt.batch_oracle(np.ones(2), "center", 4)
+        opt.close()
+        opt.close()
+        assert opt._pool is None
+
+    def test_context_manager_closes_pool(self):
+        with ZO_gauss_min(f_quadratic, np.zeros(2), mu=1e-8, t=4, n_jobs=2) as opt:
+            opt.batch_oracle(np.ones(2), "center", 4)
+            assert opt._pool is not None
+        assert opt._pool is None
+
+    def test_worker_threads_are_released_on_close(self):
+        before = threading.active_count()
+        opt = ZO_gauss_min(f_quadratic, np.zeros(2), mu=1e-8, t=8, n_jobs=4)
+        opt.batch_oracle(np.ones(2), "center", 8)
+        opt.close()
+        assert threading.active_count() == before
+
+    def test_batch_really_runs_on_several_threads(self):
+        """The samples of one batch are spread over distinct worker threads."""
+        seen = set()
+
+        def f_tracking(x):
+            seen.add(threading.get_ident())
+            time.sleep(0.002)
+            return f_quadratic(x)
+
+        np.random.seed(0)
+        with ZO_gauss_min(f_tracking, np.zeros(2), mu=1e-8, t=8, n_jobs=4) as opt:
+            opt.batch_oracle(np.ones(2), "center", 8)
+        assert len(seen) > 1
+
+    def test_sequential_batch_runs_on_one_thread(self):
+        seen = set()
+
+        def f_tracking(x):
+            seen.add(threading.get_ident())
+            return f_quadratic(x)
+
+        np.random.seed(0)
+        opt = ZO_gauss_min(f_tracking, np.zeros(2), mu=1e-8, t=8, n_jobs=1)
+        opt.batch_oracle(np.ones(2), "center", 8)
+        assert seen == {threading.get_ident()}
+
+    def test_every_sample_is_evaluated_exactly_once(self):
+        """Chunking must not drop or duplicate samples."""
+        counter = {"n": 0}
+        lock = threading.Lock()
+
+        def f_counting(x):
+            with lock:
+                counter["n"] += 1
+            return f_quadratic(x)
+
+        np.random.seed(0)
+        with ZO_gauss_min(f_counting, np.zeros(2), mu=1e-8, t=10, n_jobs=4) as opt:
+            opt.batch_oracle(np.ones(2), "center", 10)
+        assert counter["n"] == 20            # 10 samples x 2 evals (centered)
+
+    def test_parallel_and_sequential_agree(self):
+        """Both estimate the same gradient; only the summation order differs."""
+        x = np.array([2.0, -1.0])
+        np.random.seed(11)
+        seq = ZO_gauss_min(f_quadratic, np.zeros(2), mu=1e-8,
+                           t=3000).batch_oracle(x, "center", 3000)
+        np.random.seed(11)
+        with ZO_gauss_min(f_quadratic, np.zeros(2), mu=1e-8, t=3000,
+                          n_jobs=4) as opt:
+            par = opt.batch_oracle(x, "center", 3000)
+        np.testing.assert_allclose(seq, x, atol=0.2)
+        np.testing.assert_allclose(par, x, atol=0.2)
+
+    def test_more_workers_than_samples(self):
+        np.random.seed(0)
+        with ZO_gauss_min(f_quadratic, np.zeros(2), mu=1e-8, t=3, n_jobs=8) as opt:
+            assert opt.batch_oracle(np.ones(2), "center", 3).shape == (2,)
+
+    def test_single_sample_with_many_workers(self):
+        np.random.seed(0)
+        with ZO_gauss_min(f_quadratic, np.full(2, 3.0), h=0.1, mu=1e-8,
+                          N=20, t=1, n_jobs=4) as opt:
+            assert opt.ZOGD("center").shape == (20, 2)
+
+    @pytest.mark.parametrize("algorithm", ["ZOGD", "ZOEGm"])
+    def test_solvers_converge_with_parallel_workers(self, algorithm):
+        np.random.seed(42)
+        with _make_solver(d=2, N=1500, t=8, n_jobs=4) as opt:
+            x = getattr(opt, algorithm)(method="center")
+        assert f_quadratic(x[-1]) < f_quadratic(x[0]) * 0.01
+
+    def test_t_iteration_with_parallel_workers(self):
+        np.random.seed(0)
+        with ZO_gauss_min(f_quadratic, np.full(2, 5.0), h=0.05, mu=1e-8,
+                          N=60, t="iteration", n_jobs=4) as opt:
+            assert opt.ZOGD("center").shape == (60, 2)
+
+    def test_tol_f_early_stop_with_parallel_workers(self):
+        np.random.seed(42)
+        with ZO_gauss_min(f_quadratic, np.array([5.0]), h=0.1, mu=1e-8,
+                          N=5000, t=8, tol_f=1e-3, n_jobs=4) as opt:
+            assert len(opt.ZOGD("center")) < 5000
+
+    def test_tol_g_early_stop_with_parallel_workers(self):
+        np.random.seed(42)
+        with ZO_gauss_min(f_quadratic, np.array([5.0]), h=0.1, mu=1e-8,
+                          N=5000, t=8, tol_g=1e10, n_jobs=4) as opt:
+            assert len(opt.ZOGD("center")) < 5000
+
+    def test_projection_still_holds_with_parallel_workers(self):
+        np.random.seed(42)
+        with ZO_gauss_min(f_quadratic, np.array([5.0, 5.0]), h=1.0, mu=1e-8,
+                          N=100, t=8, proj=proj_box, project_init=True,
+                          n_jobs=4) as opt:
+            x = opt.ZOGD("center")
+        assert np.all(np.abs(x) <= 3.0 + 1e-10)
+
+    def test_solver_is_picklable_without_its_pool(self):
+        """Required so bound methods can be shipped to worker processes."""
+        import pickle
+        opt = ZO_gauss_min(f_quadratic, np.zeros(2), mu=1e-8, t=4, n_jobs=2)
+        opt.batch_oracle(np.ones(2), "center", 4)
+        assert opt._pool is not None
+        clone = pickle.loads(pickle.dumps(opt))
+        assert clone._pool is None
+        assert clone.n_jobs == 2
+        opt.close()
+
+
+class TestProcessBackend:
+    """The process backend needs a picklable func; f_slow lives at module level."""
+
+    def test_process_backend_gives_an_unbiased_mean(self):
+        x = np.array([2.0, -1.0])
+        with ZO_gauss_min(f_slow, np.zeros(2), mu=1e-8, t=64,
+                          n_jobs=2, backend="process") as opt:
+            est = opt.batch_oracle(x, "center", 64)
+        np.testing.assert_allclose(est, x, atol=1.0)
+
+    def test_process_backend_runs_a_full_solver(self):
+        with ZO_gauss_min(f_slow, np.full(2, 5.0), h=0.2, mu=1e-8, N=8, t=8,
+                          n_jobs=2, backend="process") as opt:
+            x = opt.ZOGD("center")
+        assert x.shape == (8, 2)
+        assert f_quadratic(x[-1]) < f_quadratic(x[0])

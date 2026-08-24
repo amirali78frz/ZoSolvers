@@ -10,10 +10,13 @@ Demonstrates:
   - Box-projected (constrained) variants
   - Forward / backward / centered finite-difference methods
   - Fixed vs growing (t="iteration") mini-batch size
+  - Parallel mini-batches via n_jobs (thread and process backends)
+  - project_init: whether x0 itself is projected onto the feasible set
   - tol_f early stopping
 """
 
 import sys
+import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -23,7 +26,9 @@ from ZoSolvers.minimisation import ZO_gauss_min
 
 
 # ---------------------------------------------------------------------------
-# Problem:  f(x) = x0^2 + x1^2 + x0*x1,   minimum at x* = [0, 0]
+# Problem:  f(x) = 10*||x||^2 + 0.5*sin(x0) + 0.5*cos(x1)
+#           Smooth, non-quadratic; the minimum sits near (but not exactly at)
+#           the origin because of the sinusoidal terms.
 # ---------------------------------------------------------------------------
 
 def f(x):
@@ -94,11 +99,18 @@ print(SEP)
 print("ZOGD — unconstrained vs projected (box [-2, 2]^2)")
 print(SEP)
 traj_uncon = ZO_gauss_min(f, x0, **KW).ZOGD(method="center")
-traj_proj  = ZO_gauss_min(f, x0, **KW, proj=proj).ZOGD(method="center")
+traj_proj  = ZO_gauss_min(f, x0, **KW, proj=proj,
+                          project_init=True).ZOGD(method="center")
 report("Unconstrained",    traj_uncon)
 report("Projected",        traj_proj)
 feasible = np.all(traj_proj >= -2 - 1e-9) and np.all(traj_proj <= 2 + 1e-9)
 print(f"  All projected iterates inside box [-2, 2]^2: {feasible}")
+print(f"  x0 was projected onto the box: {x0} -> {traj_proj[0]}")
+
+# project_init=False (the default) hands x0 back untouched, so the first row
+# of the trajectory can sit outside the feasible set.
+traj_raw0 = ZO_gauss_min(f, x0, **KW, proj=proj).ZOGD(method="center")
+print(f"  With project_init=False, first iterate is x0 itself: {traj_raw0[0]}")
 print()
 
 # ===========================================================================
@@ -135,11 +147,51 @@ print()
 print(SEP)
 print("ZOEGm — Sphere oracle + full B + projection")
 print(SEP)
-traj_eg_full = ZO_gauss_min(f, x0, **KW, B=B_full,
-                             oracle_type="sphere", proj=proj).ZOEGm(method="center")
+traj_eg_full = ZO_gauss_min(f, x0, **KW, B=B_full, oracle_type="sphere",
+                             proj=proj, project_init=True).ZOEGm(method="center")
 report("Sphere + full B + proj", traj_eg_full)
 feasible = np.all(traj_eg_full >= -2 - 1e-9) and np.all(traj_eg_full <= 2 + 1e-9)
 print(f"  All iterates inside box [-2, 2]^2: {feasible}")
+print()
+
+# ===========================================================================
+print(SEP)
+print("ZOGD — parallel mini-batches (n_jobs)")
+print(SEP)
+print("  The t samples of one step are independent, so they can be evaluated")
+print("  concurrently. f_slow below sleeps 2 ms per call to stand in for a")
+print("  black-box simulator -- a cheap analytic f is dominated by scheduling")
+print("  overhead and shows no gain, so leave n_jobs=1 for those.")
+print()
+
+def f_slow(x):
+    """Same objective as f, but priced like a simulator call."""
+    time.sleep(0.002)
+    return f(x)
+
+KW_PAR  = dict(h=1e-2, mu=1e-5, N=30, t=8)
+n_evals = KW_PAR["N"] * KW_PAR["t"] * 2          # centered difference
+print(f"  ZOGD with N={KW_PAR['N']}, t={KW_PAR['t']}  "
+      f"({n_evals} function evaluations per run)")
+
+baseline = None
+for n_jobs in (1, 2, 4, -1):
+    opt = ZO_gauss_min(f_slow, x0, **KW_PAR, n_jobs=n_jobs)
+    start = time.perf_counter()
+    traj  = opt.ZOGD(method="center")
+    took  = time.perf_counter() - start
+    opt.close()
+    if baseline is None:
+        baseline = took
+    label = f"n_jobs = {n_jobs}" + (f"  (all {opt.n_jobs} cores)" if n_jobs == -1 else "")
+    print(f"  {label:<30s} {took:6.2f}s   speed-up x{baseline / took:4.2f}   "
+          f"f_final={f(traj[-1]):9.6f}")
+print()
+print("  The worker pool is built once and reused for every iteration.")
+print("  Use the solver as a context manager to shut it down automatically:")
+print()
+print("      with ZO_gauss_min(f, x0, t=32, n_jobs=-1) as opt:")
+print("          traj = opt.ZOGD(method='center')")
 print()
 
 # ===========================================================================
@@ -148,7 +200,7 @@ print()
 
 fig, axes = plt.subplots(2, 3, figsize=(15, 8))
 fig.suptitle(
-    r"ZO Minimisation — $f(x)=x_0^2+x_1^2+x_0x_1$,  $x_0=[5,-5]$",
+    r"ZO Minimisation — $f(x)=10\|x\|^2+0.5\sin(x_0)+0.5\cos(x_1)$,  $x_0=[5,-5]$",
     fontsize=13)
 
 # 1: oracle type

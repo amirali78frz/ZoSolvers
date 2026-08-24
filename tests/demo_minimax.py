@@ -11,10 +11,13 @@ Demonstrates:
   - Forward / backward / centered finite-difference methods
   - Fixed vs growing (t="iteration") mini-batch size
   - tau (step-size ratio) effect
+  - Parallel mini-batches via n_jobs
+  - project_init: whether x0 / y0 are projected onto their feasible sets
   - tol early stopping
 """
 
 import sys
+import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -123,7 +126,8 @@ print("ZOGDA — unconstrained vs projected (box [-7, 7]^2)")
 print(SEP)
 traj_ux, traj_uy = ZO_gauss_minmax(f, x0, y0, **KW).ZOGDA(method="center")
 traj_px, traj_py = ZO_gauss_minmax(f, x0, y0, **KW,
-                                    proj_x=proj, proj_y=proj).ZOGDA(method="center")
+                                    proj_x=proj, proj_y=proj,
+                                    project_init=True).ZOGDA(method="center")
 report("Unconstrained", traj_ux, traj_uy)
 report("Projected",     traj_px, traj_py)
 fx = np.all(traj_px >= -7 - 1e-9) and np.all(traj_px <= 7 + 1e-9)
@@ -158,7 +162,8 @@ print(SEP)
 traj_egx, traj_egy = ZO_gauss_minmax(f, x0, y0, **KW,
                                       B_x=B_full, B_y=B_full,
                                       oracle_type="sphere",
-                                      proj_x=proj, proj_y=proj).ZOEGmm(method="center")
+                                      proj_x=proj, proj_y=proj,
+                                      project_init=True).ZOEGmm(method="center")
 report("Sphere + full B + proj", traj_egx, traj_egy)
 print()
 
@@ -172,6 +177,48 @@ traj_itx, traj_ity = ZO_gauss_minmax(f, x0, y0,
                                        h=1e-3, tau=1, mu=1e-8,
                                        N=200, t="iteration").ZOEGmm(method="center")
 report("t = iteration", traj_itx, traj_ity)
+print()
+
+# ===========================================================================
+print(SEP)
+print("ZOGDA — parallel mini-batches (n_jobs)")
+print(SEP)
+print("  The t samples of one step are independent draws, so they can be")
+print("  evaluated concurrently. f_slow sleeps 2 ms per call to stand in for a")
+print("  black-box simulator; a cheap analytic f is dominated by scheduling")
+print("  overhead and shows no gain, so leave n_jobs=1 for those.")
+print()
+
+def f_slow(x, y):
+    """Same objective as f, but priced like a simulator call."""
+    time.sleep(0.002)
+    return f(x, y)
+
+KW_PAR  = dict(h=1e-3, tau=1, mu=1e-8, N=25, t=8)
+n_evals = KW_PAR["N"] * KW_PAR["t"] * 2      # centered difference, shared by x and y
+print(f"  ZOGDA with N={KW_PAR['N']}, t={KW_PAR['t']}  "
+      f"({n_evals} function evaluations per run)")
+
+baseline = None
+for n_jobs in (1, 2, 4, -1):
+    opt = ZO_gauss_minmax(f_slow, x0, y0, **KW_PAR, n_jobs=n_jobs)
+    start  = time.perf_counter()
+    xx, yy = opt.ZOGDA(method="center")
+    took   = time.perf_counter() - start
+    opt.close()
+    if baseline is None:
+        baseline = took
+    label = f"n_jobs = {n_jobs}" + (f"  (all {opt.n_jobs} cores)" if n_jobs == -1 else "")
+    print(f"  {label:<30s} {took:6.2f}s   speed-up x{baseline / took:4.2f}   "
+          f"||x||={np.linalg.norm(xx[-1]):7.4f}")
+print()
+print("  Both partial oracles come from a single finite difference, so one")
+print("  sample costs 2 evaluations for a centered difference, not 4.")
+print()
+print("  Use the solver as a context manager to release the pool automatically:")
+print()
+print("      with ZO_gauss_minmax(f, x0, y0, t=16, n_jobs=-1) as opt:")
+print("          x_traj, y_traj = opt.ZOGDA(method='center')")
 print()
 
 # ===========================================================================
