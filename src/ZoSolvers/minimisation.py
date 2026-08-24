@@ -1,11 +1,12 @@
 import numpy as np
-from .utils import is_diagonal
+from .utils import ParallelBatchMixin, is_diagonal
 
 
-class ZO_gauss_min:
+class ZO_gauss_min(ParallelBatchMixin):
     def __init__(self, func, x0, h=1e-3, mu=1e-5, N=10000, t=1,
                  tol_f=None, tol_g=None, B=None, proj=None,
-                 oracle_type="gaussian"):
+                 oracle_type="gaussian", project_init=False,
+                 n_jobs=1, backend="thread"):
         """
         Zeroth-order minimisation with Gaussian or sphere random oracle.
 
@@ -31,11 +32,29 @@ class ZO_gauss_min:
             Precision matrix (inverse of covariance). If None, uses the identity.
         proj : callable, optional
             Projection onto the feasible set. If None, unconstrained.
+        project_init : bool
+            Whether to project the initial guess x0 onto the feasible set
+            before the first step. False (default) returns x0 exactly as given,
+            so the first row of the trajectory may be infeasible when x0 lies
+            outside the constraint set. True makes every returned iterate
+            feasible, including the first. Has no effect when proj is None.
         oracle_type : {"gaussian", "sphere"}
             "gaussian" : direction u ~ N(0, B^{-1}).
             "sphere"   : direction u uniform on the B-metric unit sphere,
                          i.e. u = L s where s ~ Uniform(S^{d-1}) and
                          L = chol(B^{-1}). The oracle is scaled by d.
+        n_jobs : int
+            Number of workers used to evaluate the `t` samples of one
+            mini-batch. 1 (default) runs sequentially; -1 uses all CPU cores,
+            -2 all but one. Samples are split into one chunk per worker, so
+            the speed-up only materialises when the cost function is expensive
+            relative to the scheduling overhead.
+        backend : {"thread", "process"}
+            Parallel backend. "thread" (default) accepts any callable and pays
+            off when `func` releases the GIL (NumPy-heavy code, compiled
+            extensions, external simulators). "process" gives true parallelism
+            for pure-Python CPU-bound `func`, but requires `func` to be
+            picklable and breaks `np.random.seed` reproducibility.
         """
         self.func = func
         self.x0 = np.asarray(x0, dtype=float)
@@ -49,6 +68,8 @@ class ZO_gauss_min:
         self.tolg = tol_g
         self.d = len(self.x0)
         self.oracle_type = oracle_type
+        self.project_init = bool(project_init)
+        self._init_parallel(n_jobs, backend)
 
         if oracle_type not in ("gaussian", "sphere"):
             raise ValueError("oracle_type must be 'gaussian' or 'sphere'.")
@@ -140,15 +161,43 @@ class ZO_gauss_min:
         """Return a safe modulo period (at least 1) to avoid ZeroDivisionError."""
         return max(1, int(self.N / base))
 
+    def _num_samples(self, k):
+        return k if self.t == "iteration" else self.t
+
+    def _oracle_sum(self, n, x, method):
+        """Sum of n independent oracle draws at x. One worker's share of a batch."""
+        total = np.zeros(self.d)
+        for _ in range(n):
+            total += self.oracle(x, method)
+        return total
+
+    def batch_oracle(self, x, method, n):
+        """Mean of n independent oracle draws at x, evaluated over n_jobs workers."""
+        partials = self._map_chunks(self._oracle_sum, n, x, method)
+        return sum(partials) / n
+
+    def _oracle_sq_norm_sum(self, n, x, method):
+        return sum(np.linalg.norm(self.oracle(x, method)) ** 2 for _ in range(n))
+
+    def _oracle_sq_norm(self, x, method, n):
+        """Mean squared oracle norm at x, evaluated over n_jobs workers."""
+        partials = self._map_chunks(self._oracle_sq_norm_sum, n, x, method)
+        return sum(partials) / n
+
+    def _initial_x(self):
+        """Starting iterate, projected onto the feasible set if requested."""
+        if self.proj is not None and self.project_init:
+            return self.proj(self.x0)
+        return self.x0
+
     def step(self, x, method, k, gamma=1.0):
-        ns = k if self.t == "iteration" else self.t
-        grd = sum(self.oracle(x, method) for _ in range(ns)) / ns
+        grd = self.batch_oracle(x, method, self._num_samples(k))
         return x - gamma * self.h * grd
 
     def ZOGD(self, method="forw"):
         """Zeroth-order gradient descent."""
-        x = [self.x0]
-        fval0 = self.func(self.x0)
+        x = [self._initial_x()]
+        fval0 = self.func(x[0])
         period_f = self._check_period(50)
         period_g = self._check_period(50)
 
@@ -163,8 +212,7 @@ class ZO_gauss_min:
                     break
 
             if self.tolg is not None and (k + 1) % period_g == 0:
-                gg = sum(np.linalg.norm(self.oracle(x_new, method)) ** 2
-                         for _ in range(10)) / 10
+                gg = self._oracle_sq_norm(x_new, method, 10)
                 if self.proj is not None:
                     # Projected residual proxy
                     gg = sum(
@@ -180,16 +228,17 @@ class ZO_gauss_min:
 
     def ZOEGm(self, method="forw", gamma=1.0):
         """Zeroth-order extra-gradient (minimisation)."""
-        x = [self.x0]
-        fval0 = self.func(self.x0)
+        x = [self._initial_x()]
+        fval0 = self.func(x[0])
         period_f = self._check_period(10)
         period_g = self._check_period(50)
 
         for k in range(self.N - 1):
             xhat = self.step(x[-1], method, k + 1)
-            x_new = self.step(xhat, method, k + 1, gamma=gamma)
             if self.proj is not None:
                 xhat = self.proj(xhat)
+            x_new = self.step(xhat, method, k + 1, gamma=gamma)
+            if self.proj is not None:
                 x_new = self.proj(x_new)
             x.append(x_new)
 
@@ -199,8 +248,7 @@ class ZO_gauss_min:
 
             if self.tolg is not None and (k + 1) % period_g == 0:
                 if self.proj is None:
-                    gg = sum(np.linalg.norm(self.oracle(x_new, method)) ** 2
-                             for _ in range(10)) / 10
+                    gg = self._oracle_sq_norm(x_new, method, 10)
                 else:
                     gg = 0.0
                     for _ in range(10):
