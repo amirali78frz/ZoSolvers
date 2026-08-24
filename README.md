@@ -6,7 +6,7 @@ ZoSolvers provides gradient-free solvers for **minimisation** and **minimax** pr
 
 📖 Full documentation: [ZoSolvers Manual (PDF)](Docs/ZoSolvers_Manual.pdf)
 
-[PyPI](https://pypi.org/project/ZoSolvers/))
+[PyPI](https://pypi.org/project/ZoSolvers/)
 
 ---
 
