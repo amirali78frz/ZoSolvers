@@ -16,8 +16,9 @@ ZoSolvers provides gradient-free solvers for **minimisation** and **minimax** pr
 - **Flexible mini-batching** — fixed number of oracle samples per step, or a growing schedule (`t="iteration"`)
 - **Constrained problems** — pass any projection function
 - **Early stopping** — based on relative function decrease or oracle norm
+- **Parallel mini-batches** — the `t` oracle samples per step are evaluated across `n_jobs` workers (thread or process backend)
 - **Efficient sampling** — Cholesky factorisation cached at construction; diagonal `B` handled without matrix inversion
-- **Parallelism** — utilisation of CPU cores to evaluate the samples of one mini-batch in parallel
+
 ---
 
 ## Installation
