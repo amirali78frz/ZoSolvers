@@ -126,6 +126,7 @@ x_traj = opt.ZOGD(method="center")
 | `N` | Maximum number of iterations |
 | `t` | Oracle samples per step (`int` or `"iteration"` for growing schedule) |
 | `B` | Precision matrix shaping the perturbation distribution (`None` = identity) |
+| `n_jobs` | Number of workers used to evaluate the samples of one mini-batch in parallel.|
 | `oracle_type` | `"gaussian"` or `"sphere"` |
 | `proj` | Projection onto the feasible set (`None` = unconstrained) |
 | `tau` | *(Minimax)* Step-size ratio: x-step = `h/tau`, y-step = `h` |
